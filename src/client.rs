@@ -116,22 +116,52 @@ fn unique_client_id() -> String {
 // for it.
 pub use crate::core::command::{report_topic, request_topic};
 
+#[derive(Debug, Clone)]
+pub struct ClientOptions {
+    pub timeout: Duration,
+    /// max packet size incoming
+    pub max_incoming: usize,
+    /// max packet size outgoing
+    pub max_outgoing: usize,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        ClientOptions {
+            timeout: DEFAULT_TIMEOUT,
+            max_outgoing: 21776,
+            max_incoming: 21776,
+        }
+    }
+}
+
 /// A one-shot LAN MQTT client.
 pub struct LanMqttClient {
     target: ResolvedTarget,
-    timeout: Duration,
+    options: ClientOptions
 }
 
 impl LanMqttClient {
     pub fn new(target: ResolvedTarget) -> Self {
         Self {
             target,
-            timeout: DEFAULT_TIMEOUT,
+            options: ClientOptions::default(),
         }
     }
 
+    pub fn with_options(target: ResolvedTarget, options: ClientOptions) -> Self {
+        Self {
+            target,
+            options,
+        }
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.options.timeout
+    }
+
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.options.timeout = timeout;
         self
     }
 
@@ -141,6 +171,7 @@ impl LanMqttClient {
         opts.set_credentials(MQTT_USER, &self.target.access_code);
         opts.set_keep_alive(Duration::from_secs(30));
         opts.set_transport(Transport::Tls(tls_config()?));
+        opts.set_max_packet_size(self.options.max_incoming, self.options.max_outgoing);
 
         let (client, eventloop) = AsyncClient::new(opts, 16);
         client
@@ -347,7 +378,7 @@ impl LanMqttClient {
             .enable_all()
             .build()
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
-        rt.block_on(self.watch_async(interval, true, Some(self.timeout), on_update))
+        rt.block_on(self.watch_async(interval, true, Some(self.timeout()), on_update))
     }
 
     /// Drive **one long-lived connection** that streams reports out and
@@ -517,7 +548,7 @@ impl LanMqttClient {
         // configured timeout regardless of how long connecting took; the outer net
         // in send_and_verify guards a connect/network hang.
         let mut session = VerifySession::new(cmd.clone(), seq);
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = tokio::time::Instant::now() + self.timeout();
         loop {
             let ev = match tokio::time::timeout_at(deadline, poll(&mut eventloop)).await {
                 Err(_) => return Ok(session.timed_out()),
@@ -542,7 +573,7 @@ impl LanMqttClient {
         // send_and_verify_async manages its own per-phase deadline and returns
         // Unverified on a verify timeout; this outer net only guards a
         // connect/network hang.
-        let net = self.timeout + Duration::from_secs(5);
+        let net = self.timeout() + Duration::from_secs(5);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -563,7 +594,7 @@ impl LanMqttClient {
     /// `connect`. Waiting for the CONNACK here is what actually bounds it, and
     /// it keeps the connect cost out of the first step's verify budget.
     async fn connect_ready(&self) -> Result<(AsyncClient, EventLoop), ClientError> {
-        tokio::time::timeout(self.timeout, async {
+        tokio::time::timeout(self.timeout(), async {
             let (client, mut eventloop) = self.connect().await?;
             loop {
                 if matches!(
@@ -575,7 +606,7 @@ impl LanMqttClient {
             }
         })
         .await
-        .unwrap_or(Err(ClientError::Timeout(self.timeout)))
+        .unwrap_or(Err(ClientError::Timeout(self.timeout())))
     }
 
     /// Publish one command and wait for its verdict, folding every report seen
@@ -603,7 +634,7 @@ impl LanMqttClient {
         // abort a healthy sequence; what needs bounding is a single step
         // going unanswered.
         let mut session = VerifySession::new(cmd.clone(), seq);
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = tokio::time::Instant::now() + self.timeout();
         loop {
             let ev = match tokio::time::timeout_at(deadline, poll(eventloop)).await {
                 Err(_) => return Ok(session.timed_out()),
@@ -759,10 +790,10 @@ impl LanMqttClient {
             )
             .await
             .map_err(|e| ClientError::Mqtt(e.to_string()))?;
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        let deadline = tokio::time::Instant::now() + self.timeout();
         loop {
             let ev = match tokio::time::timeout_at(deadline, poll(eventloop)).await {
-                Err(_) => return Err(ClientError::Timeout(self.timeout)),
+                Err(_) => return Err(ClientError::Timeout(self.timeout())),
                 Ok(ev) => ev?,
             };
             if let Event::Incoming(Packet::Publish(p)) = ev
@@ -803,7 +834,7 @@ impl LanMqttClient {
             // Without a reading there is no sentinel that can be trusted, and
             // guessing one risks ending the wait on a value that was already
             // there. Refusing is the safe direction.
-            return Err(ClientError::Timeout(self.timeout));
+            return Err(ClientError::Timeout(self.timeout()));
         };
         // No value left whose appearance would prove anything. Refuse rather
         // than settle for a compromised one: a sentinel the sequence also
@@ -983,9 +1014,9 @@ impl LanMqttClient {
             .build()
             .map_err(|e| ClientError::Runtime(e.to_string()))?;
         rt.block_on(async {
-            tokio::time::timeout(self.timeout, fut)
+            tokio::time::timeout(self.timeout(), fut)
                 .await
-                .unwrap_or(Err(ClientError::Timeout(self.timeout)))
+                .unwrap_or(Err(ClientError::Timeout(self.timeout())))
         })
     }
 }
