@@ -247,7 +247,7 @@ impl LanMqttClient {
         self.run_with_timeout(self.fetch_version_async())
     }
 
-    async fn watch_async<F: FnMut(&ReportState) -> WatchStep>(
+    pub async fn watch_async<F: FnMut(&ReportState) -> WatchStep>(
         &self,
         interval: Option<Duration>,
         reconnect: bool,
