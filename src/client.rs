@@ -190,7 +190,7 @@ impl LanMqttClient {
         Ok((client, eventloop))
     }
 
-    async fn fetch_async(&self) -> Result<ReportState, ClientError> {
+    pub async fn fetch_async(&self) -> Result<ReportState, ClientError> {
         // Hold `_client` so the event loop stays connected.
         let (_client, mut eventloop) = self.connect().await?;
         let mut state = ReportState::new();
