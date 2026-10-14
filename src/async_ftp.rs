@@ -1,0 +1,273 @@
+//! FTPS file transfer — the printer's LAN file store.
+//!
+//! **Implicit** FTPS on port 990, same `bblp` + access-code auth as MQTT, and the
+//! same self-signed X.509 **v1** certificate — so it shares the LAN rustls config
+//! ([`crate::tls`]), which accepts any certificate (the rustls equivalent of OpenSSL
+//! `CERT_NONE`), acceptable only for this LAN-direct self-signed case.
+
+use std::path::Path;
+
+use futures_util::TryFutureExt;
+use std::time::Duration;
+use serde::Serialize;
+use suppaftp::RustlsConnector;
+use suppaftp::tokio::{
+    AsyncRustlsConnector, AsyncRustlsFtpStream, AsyncRustlsStream, ImplAsyncFtpStream,
+};
+use tokio_rustls::client::TlsConnector;
+
+use crate::config::ResolvedTarget;
+
+const FTP_USER: &str = "bblp";
+
+/// One entry from a directory listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// Parse one FTP `LIST` line into a [`FileEntry`]; `None` for unparseable lines
+/// (a `total N` header, blank lines, the `.`/`..` pseudo-entries).
+fn parse_list_line(line: &str) -> Option<FileEntry> {
+    // `ls -l` prefixes a `total N` summary line; suppaftp's lenient parser would
+    // otherwise turn it into a bogus entry named "total N".
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("total ") || trimmed.is_empty() {
+        return None;
+    }
+    let f = suppaftp::list::File::try_from(line).ok()?;
+    let name = f.name().to_string();
+    if name == "." || name == ".." || name.is_empty() {
+        return None;
+    }
+    Some(FileEntry {
+        name,
+        is_dir: f.is_directory(),
+        size: f.size() as u64,
+    })
+}
+
+/// Errors from FTPS operations. Messages never include the access code.
+#[derive(Debug, thiserror::Error)]
+pub enum FtpError {
+    #[error("TLS setup failed: {0}")]
+    Tls(String),
+    #[error("FTP error: {0}")]
+    Ftp(String),
+    #[error("local file error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// The temp path a download streams to before the atomic rename: `<local>.part`
+/// (same directory, so the rename stays on one filesystem and is atomic).
+fn part_path(local: &Path) -> std::path::PathBuf {
+    let mut name = local.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    local.with_file_name(name)
+}
+
+/// A one-shot FTPS client (connect → act → quit per call).
+pub struct FtpsClient {
+    target: ResolvedTarget,
+}
+
+impl FtpsClient {
+    pub fn new(target: ResolvedTarget) -> Self {
+        Self { target }
+    }
+
+    async fn connect(&self) -> Result<ImplAsyncFtpStream<AsyncRustlsStream>, FtpError> {
+        let config = crate::tls::lan_client_config().map_err(|e| FtpError::Tls(e.to_string()))?;
+        let mut ftp = AsyncRustlsFtpStream::connect_timeout(
+            self.target
+                .ip
+                .as_str()
+                .parse()
+                .map_err(|e: std::net::AddrParseError| FtpError::Ftp(e.to_string()))?,
+            Duration::from_millis(1000),
+        )
+        .await
+        .map_err(|e| FtpError::Ftp(e.to_string()))?
+        .into_secure(
+            AsyncRustlsConnector::from(TlsConnector::from(config)),
+            self.target.ip.as_str(),
+        )
+        .await
+        .map_err(|e| FtpError::Ftp(e.to_string()))?;
+        ftp.login(FTP_USER, &self.target.access_code)
+            .await
+            .map_err(|e| FtpError::Ftp(e.to_string()))?;
+        Ok(ftp)
+    }
+
+    /// List file names in `dir` (FTP `NLST`).
+    pub async fn list(&self, dir: &str) -> Result<Vec<String>, FtpError> {
+        let mut ftp = self.connect().await?;
+        let names = ftp
+            .nlst(Some(dir))
+            .await
+            .map_err(|e| FtpError::Ftp(e.to_string()))?;
+        let _ = ftp.quit();
+        Ok(names)
+    }
+
+    /// List `dir` with directory/size info (FTP `LIST`, parsed). Unparseable
+    /// lines (e.g. a `total N` header) are skipped.
+    pub async fn list_entries(&self, dir: &str) -> Result<Vec<FileEntry>, FtpError> {
+        let mut ftp = self.connect().await?;
+        let lines = ftp
+            .list(Some(dir))
+            .await
+            .map_err(|e| FtpError::Ftp(e.to_string()))?;
+        let _ = ftp.quit();
+        Ok(lines.iter().filter_map(|l| parse_list_line(l)).collect())
+    }
+
+    /// List `dir` as the printer's **own raw `LIST` lines**, unparsed.
+    ///
+    /// For `bambu serve --emulate`'s FTP relay: a client asking for a listing
+    /// should get the bytes the printer would have sent it. Re-rendering parsed
+    /// entries would mean inventing the timestamps and permission bits that
+    /// [`FileEntry`] drops, and a client that parses those would be reading our
+    /// invention as the printer's answer.
+    pub async fn list_raw(&self, dir: &str) -> Result<Vec<String>, FtpError> {
+        let mut ftp = self.connect().await?;
+        let lines = ftp
+            .list(Some(dir))
+            .await
+            .map_err(|e| FtpError::Ftp(e.to_string()))?;
+        let _ = ftp.quit();
+        Ok(lines)
+    }
+
+    /// Upload a local file to `remote_path` on the printer; returns bytes sent.
+    pub async fn upload(&self, local: &Path, remote_path: &str) -> Result<u64, FtpError> {
+        let mut file = tokio::fs::File::open(local).await?;
+        let mut ftp = self.connect().await?;
+        let result = ftp
+            .put_file(remote_path, &mut file)
+            .await
+            .map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+
+    /// Download `remote_path` from the printer to `local`; returns bytes written.
+    /// Streams (FTP `RETR`) so large files (e.g. timelapse videos) aren't held
+    /// in memory. Writes to a sibling temp file and atomically renames on
+    /// success, so a failed or partial transfer never clobbers an existing
+    /// destination.
+    pub async fn download(&self, remote_path: &str, local: &Path) -> Result<u64, FtpError> {
+        let tmp = part_path(local);
+        let newtmp = tmp.clone();
+        let mut ftp = self.connect().await?;
+        let result = ftp
+            .retr(remote_path, |mut reader| {
+                let newtmp = newtmp.clone();
+                Box::pin(async move {
+                    // The closure must return suppaftp's FtpResult; wrap any local
+                    // write error as a connection error so RETR is finalised cleanly.
+                    let mut file = tokio::fs::File::create(&newtmp).await
+                        .map_err(suppaftp::FtpError::ConnectionError)?;
+                    let bytes = tokio::io::copy(&mut reader, &mut file)
+                        .await
+                        .map_err(suppaftp::FtpError::ConnectionError)?;
+                    
+                    Ok((bytes, reader))
+                })
+            })
+            .await
+            .map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit().await;
+        
+        match result {
+            Ok(n) => {
+                tokio::fs::rename(&tmp, local).await?;
+                Ok(n)
+            }
+            Err(e) => {
+                // Leave no partial file behind on failure.
+                let _ = tokio::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+
+    /// Rename `from` to `to` on the printer (FTP `RNFR`/`RNTO`).
+    pub async fn rename(&self, from: &str, to: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect().await?;
+        let result = ftp
+            .rename(from, to)
+            .await
+            .map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+
+    /// Create a directory on the printer (FTP `MKD`).
+    pub async fn mkdir(&self, path: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect().await?;
+        let result = ftp
+            .mkdir(path)
+            .await
+            .map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+
+    /// Remove a directory on the printer (FTP `RMD`).
+    pub async fn rmdir(&self, path: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect().await?;
+        let result = ftp
+            .rmdir(path)
+            .await
+            .map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+
+    /// Delete `remote_path` on the printer (FTP `DELE`).
+    pub async fn delete(&self, remote_path: &str) -> Result<(), FtpError> {
+        let mut ftp = self.connect().await?;
+        let result = ftp
+            .rm(remote_path)
+            .await
+            .map_err(|e| FtpError::Ftp(e.to_string()));
+        let _ = ftp.quit();
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn part_path_is_a_sibling_with_a_part_suffix() {
+        assert_eq!(
+            part_path(Path::new("/tmp/v.mp4")),
+            Path::new("/tmp/v.mp4.part")
+        );
+        assert_eq!(part_path(Path::new("out.jpg")), Path::new("out.jpg.part"));
+    }
+
+    #[test]
+    fn parses_unix_list_lines_into_entries() {
+        let dir = parse_list_line("drwxr-xr-x 2 root root 4096 Jan 01 12:00 cache").unwrap();
+        assert_eq!(dir.name, "cache");
+        assert!(dir.is_dir);
+        let file =
+            parse_list_line("-rw-r--r-- 1 root root 1234 Jan 01 12:00 coin.gcode.3mf").unwrap();
+        assert_eq!(file.name, "coin.gcode.3mf");
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 1234);
+        // Pseudo-entries and headers are skipped.
+        assert_eq!(parse_list_line("total 8"), None);
+        assert_eq!(
+            parse_list_line("drwxr-xr-x 2 root root 4096 Jan 01 12:00 ."),
+            None
+        );
+    }
+}

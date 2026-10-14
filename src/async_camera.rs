@@ -9,16 +9,16 @@
 //! isn't streaming, the connection is accepted but no frame arrives, surfaced
 //! here as a read timeout.
 
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 use rustls::pki_types::ServerName;
-use tokio_rustls::{TlsConnector};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio_rustls::TlsConnector;
 
 use crate::config::ResolvedTarget;
 use crate::core::camerad::{self, FRAME_HEADER};
@@ -64,16 +64,17 @@ impl CameraClient {
         let tcp = TcpStream::connect((self.target.ip.as_str(), self.target.camera_port)).await?;
         //tcp.set_read_timeout(Some(self.timeout))?;
         //tcp.set_write_timeout(Some(self.timeout))?;
-        
+
         let server_name = ServerName::try_from(self.target.ip.clone())
             .map_err(|e| CameraError::Tls(e.to_string()))?;
-        
+
         let mut tls = TlsConnector::from(config)
             .connect(server_name, tcp)
             .await
             .map_err(|e| CameraError::Tls(e.to_string()))?;
 
-        tls.write_all(&camerad::auth_packet(&self.target.access_code)).await?;
+        tls.write_all(&camerad::auth_packet(&self.target.access_code))
+            .await?;
 
         let mut header = [0u8; FRAME_HEADER];
         tls.read_exact(&mut header).await?;
@@ -85,7 +86,6 @@ impl CameraClient {
         tls.read_exact(&mut jpeg).await?;
         Ok(jpeg)
     }
-
 }
 
 #[cfg(test)]

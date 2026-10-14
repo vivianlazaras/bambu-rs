@@ -138,7 +138,7 @@ impl Default for ClientOptions {
 /// A one-shot LAN MQTT client.
 pub struct LanMqttClient {
     target: ResolvedTarget,
-    options: ClientOptions
+    options: ClientOptions,
 }
 
 impl LanMqttClient {
@@ -150,10 +150,7 @@ impl LanMqttClient {
     }
 
     pub fn with_options(target: ResolvedTarget, options: ClientOptions) -> Self {
-        Self {
-            target,
-            options,
-        }
+        Self { target, options }
     }
 
     pub fn timeout(&self) -> Duration {
