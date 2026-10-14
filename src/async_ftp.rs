@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use futures_util::TryFutureExt;
-use std::time::Duration;
 use serde::Serialize;
+use std::time::Duration;
 use suppaftp::RustlsConnector;
 use suppaftp::tokio::{
     AsyncRustlsConnector, AsyncRustlsFtpStream, AsyncRustlsStream, ImplAsyncFtpStream,
@@ -81,9 +81,7 @@ impl FtpsClient {
     async fn connect(&self) -> Result<ImplAsyncFtpStream<AsyncRustlsStream>, FtpError> {
         let config = crate::tls::lan_client_config().map_err(|e| FtpError::Tls(e.to_string()))?;
         let mut ftp = AsyncRustlsFtpStream::connect_timeout(
-            self.target
-                .ip
-                .as_str()
+            format!("{}:{}", self.target.ip.as_str(), self.target.ftps_port)
                 .parse()
                 .map_err(|e: std::net::AddrParseError| FtpError::Ftp(e.to_string()))?,
             Duration::from_millis(1000),
@@ -169,19 +167,20 @@ impl FtpsClient {
                 Box::pin(async move {
                     // The closure must return suppaftp's FtpResult; wrap any local
                     // write error as a connection error so RETR is finalised cleanly.
-                    let mut file = tokio::fs::File::create(&newtmp).await
+                    let mut file = tokio::fs::File::create(&newtmp)
+                        .await
                         .map_err(suppaftp::FtpError::ConnectionError)?;
                     let bytes = tokio::io::copy(&mut reader, &mut file)
                         .await
                         .map_err(suppaftp::FtpError::ConnectionError)?;
-                    
+
                     Ok((bytes, reader))
                 })
             })
             .await
             .map_err(|e| FtpError::Ftp(e.to_string()));
         let _ = ftp.quit().await;
-        
+
         match result {
             Ok(n) => {
                 tokio::fs::rename(&tmp, local).await?;
