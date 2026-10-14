@@ -78,6 +78,7 @@ impl CameraClient {
         tls.read_exact(&mut jpeg)?;
         Ok(jpeg)
     }
+
 }
 
 #[cfg(test)]
