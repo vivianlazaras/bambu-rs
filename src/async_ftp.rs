@@ -80,29 +80,37 @@ impl FtpsClient {
 
     async fn connect(&self) -> Result<ImplAsyncFtpStream<AsyncRustlsStream>, FtpError> {
         let config = crate::tls::lan_client_config().map_err(|e| FtpError::Tls(e.to_string()))?;
-        let mut ftp = AsyncRustlsFtpStream::connect_timeout(
+        let mut ftp_insecure = AsyncRustlsFtpStream::connect_timeout(
             format!("{}:{}", self.target.ip.as_str(), self.target.ftps_port)
                 .parse()
                 .map_err(|e: std::net::AddrParseError| FtpError::Ftp(e.to_string()))?,
             Duration::from_millis(1000),
         )
         .await
-        .map_err(|e| FtpError::Ftp(e.to_string()))?
-        .into_secure(
+        .map_err(|e| FtpError::Ftp(e.to_string()))?;
+        #[cfg(debug_assertions)]
+        eprintln!("connection successful");
+        let mut ftp = ftp_insecure.into_secure(
             AsyncRustlsConnector::from(TlsConnector::from(config)),
             self.target.ip.as_str(),
         )
         .await
         .map_err(|e| FtpError::Ftp(e.to_string()))?;
+        #[cfg(debug_assertions)]
+        eprintln!("TLS connection successful");
         ftp.login(FTP_USER, &self.target.access_code)
             .await
             .map_err(|e| FtpError::Ftp(e.to_string()))?;
+        #[cfg(debug_assertions)]    
+        eprintln!("FTP login successful");
         Ok(ftp)
     }
 
     /// List file names in `dir` (FTP `NLST`).
     pub async fn list(&self, dir: &str) -> Result<Vec<String>, FtpError> {
         let mut ftp = self.connect().await?;
+        #[cfg(debug_assertions)]
+        eprintln!("connection successful listing files");
         let names = ftp
             .nlst(Some(dir))
             .await
