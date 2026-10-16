@@ -10,7 +10,7 @@ use std::path::Path;
 use futures_util::TryFutureExt;
 use serde::Serialize;
 use std::time::Duration;
-use suppaftp::RustlsConnector;
+use tokio_rustls::client::TlsConnector as RustlsTlsConnector;
 use suppaftp::tokio::{
     AsyncRustlsConnector, AsyncRustlsFtpStream, AsyncRustlsStream, ImplAsyncFtpStream,
 };
@@ -81,20 +81,11 @@ impl FtpsClient {
     async fn connect(&self) -> Result<ImplAsyncFtpStream<AsyncRustlsStream>, FtpError> {
         let config = crate::tls::lan_client_config().map_err(|e| FtpError::Tls(e.to_string()))?;
         eprintln!("about to attempt connecting");
-        let mut ftp_insecure = AsyncRustlsFtpStream::connect_timeout(
-            format!("{}:{}", self.target.ip.as_str(), self.target.ftps_port)
-                .parse()
-                .map_err(|e: std::net::AddrParseError| FtpError::Ftp(e.to_string()))?,
-            Duration::from_millis(1000),
-        )
-        .await
-        .map_err(|e| FtpError::Ftp(e.to_string()))?;
-        eprintln!("connection successful");
-        let mut ftp = ftp_insecure.into_secure(
-            AsyncRustlsConnector::from(TlsConnector::from(config)),
-            self.target.ip.as_str(),
-        )
-        .await
+        let mut ftp = AsyncRustlsFtpStream::connect_secure_implicit(
+            (self.target.ip.as_str(), self.target.ftps_port),
+            AsyncRustlsConnector::from(RustlsTlsConnector::from(config)),
+            &self.target.ip,
+        ).await
         .map_err(|e| FtpError::Ftp(e.to_string()))?;
         eprintln!("TLS connection successful");
         ftp.login(FTP_USER, &self.target.access_code)
